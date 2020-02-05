@@ -28,6 +28,7 @@ import sys
 import time
 from .raycast import raycast_sightlines
 import copy
+from .io import ZipSaveFile
 
 def render_cam_view(cadmodel,calibration,extra_actors=[],filename=None,oversampling=1,aa=1,transparency=False,verbose=True,coords = 'Display',interpolation='Cubic'):
     '''
@@ -54,6 +55,10 @@ def render_cam_view(cadmodel,calibration,extra_actors=[],filename=None,oversampl
         np.ndarray                          : Array containing the rendered 8-bit per channel RGB (h x w x 3) or RGBA (h x w x 4) image.\
                                               Also saves the result to disk if the filename parameter is set.
     '''
+
+    debug_file = ZipSaveFile('render_debug.zip','w')
+    debug_log = debug_file.open_file('render.log','w')
+
     if np.any(calibration.view_models) is None:
         raise ValueError('This calibration object does not contain any fit results! Cannot render an image without a calibration fit.')
 
@@ -79,6 +84,7 @@ def render_cam_view(cadmodel,calibration,extra_actors=[],filename=None,oversampl
 
     # This will be our result. To start with we always render in display coords.
     orig_display_shape = calibration.geometry.get_display_shape()
+    debug_log.write('Calibration image display shape: {:}\n'.format(orig_display_shape))
     output = np.zeros([int(orig_display_shape[1]*oversampling),int(orig_display_shape[0]*oversampling),3+transparency],dtype='uint8')
 
     # The un-distorted FOV is over-rendered to allow for distortion.
@@ -93,6 +99,8 @@ def render_cam_view(cadmodel,calibration,extra_actors=[],filename=None,oversampl
         fov_factor = 3.
     else:
         fov_factor = 1.5
+
+    debug_log.write('fov_factor: {:}\n'.format(fov_factor))
 
     x_pixels = orig_display_shape[0]
     y_pixels = orig_display_shape[1]
@@ -126,8 +134,11 @@ def render_cam_view(cadmodel,calibration,extra_actors=[],filename=None,oversampl
             continue
 
         cx = calibration.view_models[field].cam_matrix[0,2]
+        debug_log.write('cx: {:}\n'.format(cx))
         cy = calibration.view_models[field].cam_matrix[1,2]
+        debug_log.write('cy: {:}\n'.format(cy))
         fy = calibration.view_models[field].cam_matrix[1,1]
+        debug_log.write('fy: {:}\n'.format(fy))
 
         vtk_win_im = vtk.vtkRenderLargeImage()
         vtk_win_im.SetInput(renderer)
@@ -146,9 +157,12 @@ def render_cam_view(cadmodel,calibration,extra_actors=[],filename=None,oversampl
     
         vtk_win_im.SetMagnification(int(window_factor*aa*max(oversampling,1)))
 
+        debug_log.write('Render magnification: {:}\n'.format(int(window_factor*aa*max(oversampling,1))))
+
         width = int(wt/window_factor)
         height = int(ht/window_factor)
 
+        debug_log.write('Render window size: {:}x{:}\n'.format(width,height))
         renwin.SetSize(width,height)
 
         # Set up CAD camera
@@ -157,9 +171,13 @@ def render_cam_view(cadmodel,calibration,extra_actors=[],filename=None,oversampl
         cam_tar = calibration.get_los_direction(cx,cy,subview=field) + cam_pos
         upvec = -1.*calibration.get_cam_to_lab_rotation(subview=field)[:,1]
         camera.SetPosition(cam_pos)
+        debug_log.write('Camera position: {:}\n'.format(cam_pos))
         camera.SetViewAngle(fov_y)
+        debug_log.write('Y FOV: {:}\n'.format(fov_y))
         camera.SetFocalPoint(cam_tar)
+        debug_log.write('Camera target: {:}\n'.format(cam_tar))
         camera.SetViewUp(upvec)
+        debug_log.write('Camera up vector: {:}\n'.format(upvec))
 
         if verbose:
             print('[Calcam Renderer] Rendering (Sub-view {:d}/{:d})...'.format(field + 1,calibration.n_subviews))
@@ -182,7 +200,10 @@ def render_cam_view(cadmodel,calibration,extra_actors=[],filename=None,oversampl
         dims = vtk_image.GetDimensions()
 
         im = np.flipud(vtk_to_numpy(vtk_array).reshape(dims[1], dims[0] , 3))
-        
+
+        with debug_file.open_file('raw_render.npy','wb') as f:
+            np.save(f,im)
+
         if transparency:
             alpha = 255 * np.ones([np.shape(im)[0],np.shape(im)[1]],dtype='uint8')
             alpha[np.sum(im,axis=2) == 0] = 0
@@ -190,13 +211,27 @@ def render_cam_view(cadmodel,calibration,extra_actors=[],filename=None,oversampl
 
         im = cv2.resize(im,(int(dims[0]/aa*min(oversampling,1)),int(dims[1]/aa*min(oversampling,1))),interpolation=interp_method)
 
+        with debug_file.open_file('resized_render.npy', 'wb') as f:
+            np.save(f, im)
+
         if verbose:
             print('[Calcam Renderer] Applying lens distortion (Sub-view {:d}/{:d})...'.format(field + 1,calibration.n_subviews))
 
         # Pixel locations we want on the final image
         [xn,yn] = np.meshgrid(np.linspace(0,x_pixels-1,x_pixels*oversampling),np.linspace(0,y_pixels-1,y_pixels*oversampling))
 
+        with debug_file.open_file('x_linear.npy', 'wb') as f:
+            np.save(f, xn)
+        with debug_file.open_file('y_linear.npy', 'wb') as f:
+            np.save(f, yn)
+
         xn,yn = calibration.normalise(xn,yn,field)
+
+        with debug_file.open_file('x_norm.npy', 'wb') as f:
+            np.save(f, xn)
+
+        with debug_file.open_file('y_norm.npy', 'wb') as f:
+            np.save(f, yn)
 
         # Transform back to pixel coords where we want to sample the un-distorted render.
         # Both x and y are divided by Fy because the initial render always has Fx = Fy.
@@ -205,11 +240,20 @@ def render_cam_view(cadmodel,calibration,extra_actors=[],filename=None,oversampl
         xmap = xmap.astype('float32')
         ymap = ymap.astype('float32')
 
+        with debug_file.open_file('xmap.npy', 'wb') as f:
+            np.save(f, xmap)
+        with debug_file.open_file('ymap.npy', 'wb') as f:
+            np.save(f, ymap)
 
         # Actually apply distortion
         im  = cv2.remap(im,xmap,ymap,interp_method)
 
+        with debug_file.open_file('render_mapped.npy', 'wb') as f:
+            np.save(f, im)
+
         output[fieldmask == field,:] = im[fieldmask == field,:]
+
+
 
 
     if coords.lower() == 'original':
